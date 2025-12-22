@@ -18,6 +18,38 @@ s3 = boto3.client('s3')
 # or Lambda configuration (in AWS)
 BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 
+def get_s3_file_structure(bucket_name, folder_name):
+    """
+    Lists S3 objects under a prefix and organizes them into 
+    a dictionary: { "run_id": ["file1.tif", "file2.geojson"] }
+    """
+    try:
+        # 1. List objects with the prefix (e.g., 'data_storage/')
+        response = s3.list_objects_v2(Bucket=bucket_name, Prefix=f"{folder_name}/")
+        
+        if 'Contents' not in response:
+            return {}, None
+            
+        structure = {}
+        for obj in response['Contents']:
+            key = obj['Key']
+            # Split key: ['data_storage', 'run_id', 'filename']
+            key_parts = [p for p in key.split('/') if p]
+            
+            # We expect a structure like folder_name/run_id/file_name
+            if len(key_parts) >= 3:
+                # Based on your structure, index 1 is run_id, index 2 is file_name
+                run_id = key_parts[1]
+                file_name = key_parts[2]
+                
+                if run_id not in structure:
+                    structure[run_id] = []
+                structure[run_id].append(file_name)
+                
+        return structure, None
+    except Exception as e:
+        return None, str(e)
+
 def get_metadata(local_path):
     """
     Reads the TIF file header (using Rasterio), extracts bounds, 
@@ -132,16 +164,35 @@ def get_geojson_data(file_path):
 
 def lambda_handler(event, context):
     # 1. Parse the request from API Gateway
-    path = event.get('path', '')
-    params = event.get('pathParameters', {}) or {} # Added safety empty dict
-    run_id = params.get('run_id')
-    file_name = params.get('file_name')
+    params = event.get('pathParameters', {}) or {}
+    proxy_string = params.get('proxy', '')
 
-    if not run_id or not file_name:
-        return {"statusCode": 400, "body": json.dumps({"error": "Missing run_id or file_name"})}
+    parts = [p for p in proxy_string.split('/') if p] # Clean up any empty strings
+
+    # Set standard headers for CORS and JSON
+    headers = {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+    }
+
+    # --- NEW ROUTE: get-file-structure (e.g., /api/get-file-structure/data_storage) ---
+    if len(parts) == 3 and parts[1] == "get-file-structure":
+        folder_name = parts[2]
+        data, error = get_s3_file_structure(BUCKET_NAME, folder_name)
+        if error:
+            return {"statusCode": 500, "headers": headers, "body": json.dumps({"error": error})}
+        return {"statusCode": 200, "headers": headers, "body": json.dumps(data)}
+
+    # --- EXISTING ROUTES: Metadata and Data Processing ---
+    if len(parts) < 3:
+        return {"statusCode": 400, "headers": headers, "body": json.dumps({"error": "Invalid URL structure."})}
+
+    file_name = parts[-1]
+    run_id = parts[-2]
+    # Join everything before the run_id to get the 'command' path (e.g., 'api/metadata')
+    command_path = '/'.join(parts[:-2])
 
     # Construct the S3 Key (path in the bucket)
-    # This emulates your old data_storage/run_id/file_name structure
     s3_key = f"data_storage/{run_id}/{file_name}"
     
     # Define where to save it locally in the container
@@ -154,79 +205,58 @@ def lambda_handler(event, context):
         # 3. Route to your existing processing functions
 
         # --- METADATA PATH ---
-        # We only ever access metadata when the requested file is raster
-        if "/api/metadata" in path and file_name.endswith(RASTER_FILES): 
+        if command_path == "api/metadata" and file_name.endswith(RASTER_FILES): 
             metadata_dict, error = get_metadata(local_path)
-            
-            # Clean up the file we downloaded for metadata
-            os.remove(local_path)
+            os.remove(local_path) # Clean up metadata source
 
             if error:
-                return {"statusCode": 500, "body": json.dumps({"error": error})}
+                return {"statusCode": 500, "headers": headers, "body": json.dumps({"error": error})}
 
-            return {
-                "statusCode": 200,
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
-                },
-                "body": json.dumps(metadata_dict) # The "wrapping" step!
-            }
+            return {"statusCode": 200, "headers": headers, "body": json.dumps(metadata_dict)}
 
-        # --- RASTER PATH ---
-        elif "/api/get-data" in path and file_name.endswith(RASTER_FILES):
-            # Run your processing logic (returns path to the new PNG)
-            png_path, error = process_tif_to_png(local_path)
+        elif command_path == "api/get-data": 
             
-            if error:
-                if os.path.exists(local_path): os.remove(local_path)
-                return {"statusCode": 500, "body": json.dumps({"error": error})}
+            # --- RASTER PATH ---
+            if file_name.endswith(RASTER_FILES):
+                png_path, error = process_tif_to_png(local_path)
+                
+                if error:
+                    if os.path.exists(local_path): os.remove(local_path)
+                    return {"statusCode": 500, "headers": headers, "body": json.dumps({"error": error})}
 
-            # 4. Convert PNG to Base64 (The "Flask send_file" replacement)
-            with open(png_path, "rb") as image_file:
-                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                # 4. Convert PNG to Base64
+                with open(png_path, "rb") as image_file:
+                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
 
-            # 5. Cleanup local files immediately
-            os.remove(local_path)
-            os.remove(png_path)
+                # 5. Cleanup local files
+                os.remove(local_path)
+                os.remove(png_path)
 
-            return {
-                "statusCode": 200,
-                "headers": {
-                    "Content-Type": "image/png",
-                    "Access-Control-Allow-Origin": "*"
-                },
-                "body": encoded_string,
-                "isBase64Encoded": True
-            }
+                return {
+                    "statusCode": 200,
+                    "headers": {**headers, "Content-Type": "image/png"},
+                    "body": encoded_string,
+                    "isBase64Encoded": True
+                }
         
-        # --- VECTOR PATH ---
-        elif "/api/get-data" in path and file_name.endswith(VECTOR_FILES):
-            # get_geojson_data returns a dictionary
-            geo_data, error = get_geojson_data(local_path)
+            # --- VECTOR PATH ---
+            elif file_name.endswith(VECTOR_FILES):
+                geo_data, error = get_geojson_data(local_path)
+                os.remove(local_path)
+
+                if error:
+                    return {"statusCode": 500, "headers": headers, "body": json.dumps({"error": error})}
+
+                return {"statusCode": 200, "headers": headers, "body": json.dumps(geo_data)}
             
-            # Clean up the original file from S3
-            os.remove(local_path)
-
-            if error:
-                return {"statusCode": 500, "body": json.dumps({"error": error})}
-
-            return {
-                "statusCode": 200,
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
-                },
-                "body": json.dumps(geo_data) # Send as text, no Base64 needed!
-            }
+            # --- INVALID FILE EXTENSION ---
+            if os.path.exists(local_path): os.remove(local_path)
+            return {"statusCode": 404, "headers": headers, "body": json.dumps({"error": "Unsupported extension"})}
         
-        # 4. Final safety cleanup to prevent collisions if no routes matched
-        if os.path.exists(local_path):
-            os.remove(local_path)
-
-        return {"statusCode": 404, "body": json.dumps({"error": "Route or file type mismatch"})}
+        # Cleanup and error if no routes matched
+        if os.path.exists(local_path): os.remove(local_path)
+        return {"statusCode": 404, "headers": headers, "body": json.dumps({"error": "Unsupported route"})}
 
     except Exception as e:
-        if os.path.exists(local_path):
-            os.remove(local_path)
-        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+        if os.path.exists(local_path): os.remove(local_path)
+        return {"statusCode": 500, "headers": headers, "body": json.dumps({"error": str(e)})}
