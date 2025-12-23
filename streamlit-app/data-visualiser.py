@@ -5,13 +5,12 @@ import leafmap.foliumap as leafmap
 import json
 from io import StringIO
 import folium
-import time
 
 # --- Configuration ---
 API_BASE_URL = 'https://latdn3bjub.execute-api.eu-north-1.amazonaws.com/default'
+RASTER_EXTENSIONS = ('.tif', '.png')
+VECTOR_EXTENSIONS = ('.geojson', '.gpkg', '.shp')
 
-st.set_page_config(layout="wide")
-#st.title("🗺️ ML Geo-Visualization Client (Leafmap Edition)")
 
 # --- Session State Initialization ---
 # We use session_state to keep track of layers the user has "loaded"
@@ -87,8 +86,15 @@ try:
                 for f in files:
                     col1, col2 = st.columns([3, 1])
                     col1.text(f)
-                    if col2.button("➕", key=f"add_{run_id}_{f}"):
-                        add_to_map(run_id, f)
+                    # Logic: Only show the "+" button if it's a map-compatible file
+                    is_vector = f.lower().endswith(VECTOR_EXTENSIONS)
+                    is_raster = f.lower().endswith(RASTER_EXTENSIONS)
+
+                    if is_vector or is_raster:
+                        if col2.button("➕", key=f"add_{run_id}_{f}"):
+                            add_to_map(run_id, f)
+                    else:
+                        col2.write("")
     else:
         st.sidebar.error("Failed to load file structure.")
 except Exception as e:
